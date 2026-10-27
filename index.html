@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CLUBOTIQUE — IA et Arduino Uno</title>
+  <style>
+    :root {font-family:system-ui,Arial,sans-serif;color:#163047;background:#f2f7fc}
+    body {max-width:720px;margin:32px auto;padding:0 16px}
+    main {background:white;border-radius:18px;padding:24px;box-shadow:0 4px 22px #1232}
+    h1 {color:#087ba6;margin-bottom:4px} p {line-height:1.5}
+    label {display:block;font-weight:650;margin:18px 0 7px}
+    input {width:100%;box-sizing:border-box;padding:12px;border:1px solid #9bb1c3;border-radius:8px}
+    button {padding:12px 16px;margin:10px 6px 4px 0;border:0;border-radius:9px;background:#087ba6;color:white;font-size:15px;cursor:pointer}
+    button:disabled {background:#a6b4c0;cursor:not-allowed}
+    #stop {background:#bc3b3b} #camera canvas {max-width:100%;border-radius:12px;margin-top:15px}
+    #status {padding:12px;background:#edf5fa;border-radius:8px} #result {font-size:1.3em;font-weight:bold}
+    .leds {display:flex;gap:15px;margin:15px 0}.led {width:34px;height:34px;border-radius:50%;background:#d1d8df;border:2px solid #a8b4bd}
+    .led.active.green {background:#28b75a;box-shadow:0 0 16px #28b75a}.led.active.red {background:#e54747;box-shadow:0 0 16px #e54747}.led.active.yellow {background:#f4c62b;box-shadow:0 0 16px #f4c62b}
+    small {color:#506779}
+  </style>
+</head>
+<body>
+<main>
+  <h1>🤖 CLUBOTIQUE</h1>
+  <p>Projet IA 1 — Contrôler 3 LED avec les gestes de la main</p>
+  <p><strong>✋ Main ouverte → verte &nbsp; ✊ Poing → rouge &nbsp; ✌️ Deux doigts → jaune</strong></p>
+  <label for="model">1. Lien du modèle Teachable Machine</label>
+  <input id="model" type="url" placeholder="https://teachablemachine.withgoogle.com/models/XXXXXXXX/" autocomplete="off">
+  <div>
+    <button id="connect">2. Connecter Arduino</button>
+    <button id="start" disabled>3. Démarrer l'IA</button>
+    <button id="stop" disabled>Arrêter</button>
+  </div>
+  <p id="status" role="status" aria-live="polite">Prêt. Branche l'Arduino Uno avec le programme série à 9600 bauds.</p>
+  <div id="camera"></div>
+  <p id="result" aria-live="polite">Geste : —</p>
+  <div class="leds" aria-label="État des LED (aperçu)">
+    <div id="v" class="led green" title="Verte"></div><div id="r" class="led red" title="Rouge"></div><div id="j" class="led yellow" title="Jaune"></div>
+  </div>
+  <small>Utiliser Chrome ou Edge sur ordinateur, avec le site en HTTPS (GitHub Pages). Fermer le Moniteur série Arduino IDE avant la connexion. La webcam et le port USB nécessitent une autorisation.</small>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8.5/dist/teachablemachine-image.min.js"></script>
+<script>
+  const $ = id => document.getElementById(id);
+  let port, writer, model, webcam, running=false, busy=false, lastCommand=null, candidate=null, consecutive=0, lastSentAt=0;
+  const labels = {Verte:'V', Rouge:'R', Jaune:'J', Aucun:'X'};
+  function status(message) {$('status').textContent=message;}
+  function showLed(letter) {
+    for(const [id,command] of [['v','V'],['r','R'],['j','J']]) $(id).classList.toggle('active',letter===command);
+  }
+  async function send(letter) {
+    if(!writer || letter===lastCommand || Date.now()-lastSentAt<350) return;
+    await writer.write(new TextEncoder().encode(letter));
+    lastCommand=letter; lastSentAt=Date.now(); showLed(letter);
+  }
+  $('connect').onclick=async()=>{
+    try {
+      if(!('serial' in navigator)) throw Error('Web Serial non disponible : utilise Chrome ou Edge en HTTPS.');
+      if(port) {status('Arduino déjà connecté.');return;}
+      port=await navigator.serial.requestPort();
+      await port.open({baudRate:9600});
+      writer=port.writable.getWriter();
+      $('start').disabled=false;
+      $('connect').disabled=true;
+      status('Arduino connecté. Colle le lien du modèle puis démarre l’IA.');
+    } catch(e) {status('Connexion : '+e.message);}
+  };
+  async function predictLoop() {
+    if(!running || busy) return;
+    busy=true;
+    try {
+      webcam.update();
+      const predictions=await model.predict(webcam.canvas);
+      const best=predictions.reduce((a,b)=>b.probability>a.probability?b:a);
+      const letter=best.probability>=0.85?(labels[best.className]||'X'):'X';
+      $('result').textContent=`Geste : ${best.className} (${Math.round(best.probability*100)} %)`;
+      if(letter===candidate) consecutive++; else {candidate=letter;consecutive=1;}
+      if(consecutive>=3) await send(letter);
+    } catch(e) {status('Erreur IA : '+e.message); await stop();}
+    finally {busy=false; if(running) requestAnimationFrame(predictLoop);}
+  }
+  $('start').onclick=async()=>{
+    try {
+      if(running) return;
+      if(typeof tmImage==='undefined') throw Error('Bibliothèque IA indisponible. Vérifie Internet.');
+      let url=$('model').value.trim();
+      if(!/^https:\/\/teachablemachine\.withgoogle\.com\/models\/[A-Za-z0-9_-]+\/?$/.test(url)) throw Error('Colle un lien de modèle Teachable Machine valide.');
+      url=url.replace(/\/?$/,'/');
+      status('Chargement du modèle...');
+      model=await tmImage.load(url+'model.json',url+'metadata.json');
+      const names=model.getClassLabels();
+      if(!['Verte','Rouge','Jaune','Aucun'].every(name=>names.includes(name))) throw Error('Les classes doivent être : Verte, Rouge, Jaune, Aucun.');
+      webcam=new tmImage.Webcam(320,240,true);
+      await webcam.setup(); await webcam.play();
+      $('camera').replaceChildren(webcam.canvas);
+      running=true;candidate=null;consecutive=0;lastCommand=null;
+      $('start').disabled=true;$('stop').disabled=false;
+      status('IA démarrée. Montre un geste à la webcam !');
+      requestAnimationFrame(predictLoop);
+    } catch(e) {status('Démarrage : '+e.message); if(webcam){webcam.stop();webcam=null;}}
+  };
+  async function stop() {
+    running=false;
+    if(webcam) {webcam.stop();webcam=null;}
+    $('camera').replaceChildren();
+    $('start').disabled=!writer; $('stop').disabled=true;
+    try {await send('X');} catch(e) {status('Impossible d’éteindre les LED : '+e.message);return;}
+    showLed('X');$('result').textContent='Geste : —';status('IA arrêtée.');
+  }
+  $('stop').onclick=stop;
+  window.addEventListener('pagehide',()=>{if(webcam) webcam.stop();});
+</script>
+</body>
+</html>
